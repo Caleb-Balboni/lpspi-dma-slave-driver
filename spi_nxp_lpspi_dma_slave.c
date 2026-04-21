@@ -4,38 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- * LPSPI slave driver, DMA-based.
- *
- * Behavioral differences from the master DMA driver:
- *  - CFGR1[MASTER]=0 (set automatically by lpspi_configure based on spi_cfg).
- *  - CCR is unused (RM §66.4.2.2): SCK is supplied externally.
- *  - TCR is static for the life of a transfer (RM §66.4.2.2.1): no CONT/CONTC
- *    toggling, no end-of-transfer TCR[CONTC] clear.
- *  - CS is an input: no spi_context_cs_control() calls.
- *  - TX FIFO is pre-filled by setting FCR[TXWATER]=tx_fifo_size-1 so the FIFO
- *    fills before the external master asserts PCS (RM §66.4.2.2.1: "Before the
- *    PCS input asserts, the transmit FIFO must be filled with transmit data,
- *    or the transmit error flag sets.").
- *  - End-of-transfer is driven by RX DMA exhaustion. SR[FCF] is intentionally
- *    NOT enabled as an end-of-transfer signal. FCF can be set by the master's
- *    *previous* PCS-deassert and trigger an immediate IRQ when FCIE goes
- *    high — completing the new transfer with only 1-2 bytes received.
- *    Applications must guarantee symmetric byte counts; a misbehaving master
- *    is detected via an application-level timeout, not in this driver.
- *  - SR[TEF] / SR[REF] interrupts ARE enabled for diagnostics (TX underrun
- *    and RX overflow are real bugs the application would want to know about).
- *  - TX/RX DMA are treated as independent pipelines (no chunked state machine):
- *    each callback advances only its own side's spi_context. Wire physics
- *    couples the two byte counts.
- *
- * Limitations enforced in transceive_dma:
- *  - Total TX length must equal total RX length. The simplified callback
- *    has no NOP-fill mechanism for the shorter side; if the application
- *    underprovides TX, the master will eventually clock an empty FIFO
- *    and SR[TEF] will fire.
- */
-
 #define DT_DRV_COMPAT nxp_lpspi
 
 #include <zephyr/logging/log.h>
@@ -44,20 +12,12 @@ LOG_MODULE_DECLARE(spi_lpspi, CONFIG_SPI_LOG_LEVEL);
 #include <zephyr/drivers/dma.h>
 #include "spi_nxp_lpspi_priv.h"
 
-/* Sentinel state used to swallow a late TEF/REF IRQ that fires after the
- * RX-DMA-complete path has already finished the transfer.
- */
 typedef enum {
 	LPSPI_TRANSFER_STATE_ACTIVE,
 	LPSPI_TRANSFER_STATE_DONE,
 } lpspi_slave_state_t;
 
-/* Dummy memory used when tx_buf is NULL (TX side sends zeros).
- * Note: with the symmetric-totals precondition this is only reachable if the
- * application explicitly passed a NULL tx fragment of nonzero length.
- */
 static uint32_t tx_nop_val;
-/* Dummy memory used when rx_buf is NULL (RX side discards). */
 static uint32_t dummy_buffer;
 
 struct spi_dma_stream {
@@ -139,17 +99,13 @@ static void lpspi_dma_callback(const struct device *dev, void *arg, uint32_t cha
 	struct spi_nxp_dma_data *dma_data = (struct spi_nxp_dma_data *)data->driver_data;
 	struct spi_context *ctx = &data->ctx;
 	int ret;
-
 	if (status < 0) {
 		ret = status;
 		goto fail;
 	}
-
-	/* Late callback after a TEF/REF IRQ already aborted the transfer. */
 	if (dma_data->state == LPSPI_TRANSFER_STATE_DONE) {
 		return;
 	}
-
 	if (channel == dma_data->dma_tx.channel) {
 		spi_context_update_tx(ctx, 1, dma_data->dma_tx.dma_blk_cfg.block_size);
 
@@ -163,10 +119,6 @@ static void lpspi_dma_callback(const struct device *dev, void *arg, uint32_t cha
 				goto fail;
 			}
 		} else {
-			/* Application TX exhausted. Disable DMA requests so
-			 * any further master clocks raise TEF (visible) instead
-			 * of silently re-pushing stale TDR contents.
-			 */
 			base->DER &= ~LPSPI_DER_TDDE_MASK;
 		}
 		LOG_DBG("DMA TX block complete");
@@ -330,13 +282,6 @@ static DEVICE_API(spi, lpspi_dma_driver_api) = {
 	.release = spi_lpspi_release,
 };
 
-/*
- * Diagnostic-only ISR. The slave driver does not use FCF for end-of-transfer:
- *  - End of transfer is signaled by RX DMA exhaustion (lpspi_dma_callback).
- *  - TEF (TX underrun) and REF (RX overflow) indicate real bugs in the
- *    application's symmetric-byte-count contract or in DMA latency, so we
- *    log them and abort the in-flight transfer with -EIO.
- */
 static void lpspi_isr(const struct device *dev)
 {
 	LPSPI_Type *base = (LPSPI_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
@@ -347,36 +292,26 @@ static void lpspi_isr(const struct device *dev)
 	uint32_t ier = base->IER;
 	int err = 0;
 	bool terminate = false;
-
 	if ((sr & LPSPI_SR_TEF_MASK) && (ier & LPSPI_IER_TEIE_MASK)) {
 		base->SR = LPSPI_SR_TEF_MASK;
 		LOG_ERR("slave TX underrun (TEF)");
 		err = -EIO;
 		terminate = true;
 	}
-
 	if ((sr & LPSPI_SR_REF_MASK) && (ier & LPSPI_IER_REIE_MASK)) {
 		base->SR = LPSPI_SR_REF_MASK;
 		LOG_ERR("slave RX overflow (REF)");
 		err = -EIO;
 		terminate = true;
 	}
-
 	if (!terminate || dma_data->state == LPSPI_TRANSFER_STATE_DONE) {
 		return;
 	}
-
 	base->IER &= ~(LPSPI_IER_TEIE_MASK | LPSPI_IER_REIE_MASK);
 	base->DER &= ~(LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK);
-
 	(void)dma_stop(dma_data->dma_tx.dma_dev, dma_data->dma_tx.channel);
 	(void)dma_stop(dma_data->dma_rx.dma_dev, dma_data->dma_rx.channel);
-
-	/* Flush both FIFOs so the next transceive can't inherit stale data
-	 * (lpspi_configure has a fast path that skips the reset).
-	 */
 	base->CR |= LPSPI_CR_RTF_MASK | LPSPI_CR_RRF_MASK;
-
 	dma_data->state = LPSPI_TRANSFER_STATE_DONE;
 	spi_context_complete(ctx, dev, err);
 }
