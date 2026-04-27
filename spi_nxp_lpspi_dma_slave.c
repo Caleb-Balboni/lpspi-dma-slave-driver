@@ -217,6 +217,15 @@ static int transceive_dma(const struct device *dev, const struct spi_config *spi
 
 	base->DER |= LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK;
 
+	/* Don't return until DMA has actually pushed data into TDR. Without this, the caller
+	 * (which signals SRDY immediately on return) can let the master clock SCK before the
+	 * TX FIFO has anything in it, producing TEF underruns on the first byte. The spin is
+	 * short — DMA is much faster than the SPI clock domain.
+	 */
+	while (tx_fifo_cur_len(base) == 0) {
+		/* spin */
+	}
+
 	ret = spi_context_wait_for_completion(ctx);
 out:
 	spi_context_release(ctx, ret);
@@ -231,6 +240,30 @@ static int lpspi_dma_dev_ready(const struct device *dma_dev)
 	}
 
 	return true;
+}
+
+static int lpspi_dma_slave_release(const struct device* dev, const struct spi_config* cfg) {
+	LPSPI_Type* base = (LPSPI_Type*)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+	struct lpspi_data* data = (struct lpspi_data*)dev->data;
+	struct spi_context* ctx = &data->ctx;
+	struct spi_nxp_dma_data* dma_data = (struct spi_nxp_dma_data*)data->driver_data;
+
+	unsigned int key = irq_lock();
+	bool was_active = (dma_data->state == LPSPI_TRANSFER_STATE_ACTIVE);
+	if (was_active) {
+		base->IER &= ~(LPSPI_IER_TEIE_MASK | LPSPI_IER_REIE_MASK);
+		base->DER &= ~(LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK);
+		dma_data->state = LPSPI_TRANSFER_STATE_DONE;
+	}
+	irq_unlock(key);
+
+	if (was_active) {
+		(void)dma_stop(dma_data->dma_tx.dma_dev, dma_data->dma_tx.channel);
+		(void)dma_stop(dma_data->dma_rx.dma_dev, dma_data->dma_rx.channel);
+		base->CR |= (LPSPI_CR_RTF_MASK | LPSPI_CR_RRF_MASK);
+		spi_context_complete(ctx, dev, -ECANCELED);
+	}
+	return spi_lpspi_release(dev, cfg);
 }
 
 static int lpspi_dma_init(const struct device *dev)
@@ -279,7 +312,7 @@ static DEVICE_API(spi, lpspi_dma_driver_api) = {
 #ifdef CONFIG_SPI_RTIO
 	.iodev_submit = spi_rtio_iodev_default_submit,
 #endif
-	.release = spi_lpspi_release,
+	.release = lpspi_dma_slave_release,
 };
 
 static void lpspi_isr(const struct device *dev)
