@@ -33,6 +33,29 @@ struct spi_nxp_dma_data {
 	lpspi_slave_state_t state;
 };
 
+/* Full software reset (RST), not just RTF|RRF — clears the shift register and
+ * bit counter, which a FIFO flush leaves intact. ctx->config is invalidated so
+ * the next transceive re-runs lpspi_configure to restore CFGR1/TCR/MEN.
+ */
+static void lpspi_dma_slave_abort(LPSPI_Type *base, struct lpspi_data *data,
+				  struct spi_nxp_dma_data *dma_data)
+{
+	base->IER = 0;
+	base->DER = 0;
+	(void)dma_stop(dma_data->dma_tx.dma_dev, dma_data->dma_tx.channel);
+	(void)dma_stop(dma_data->dma_rx.dma_dev, dma_data->dma_rx.channel);
+
+	base->CR |= LPSPI_CR_RST_MASK;
+	base->CR |= LPSPI_CR_RRF_MASK | LPSPI_CR_RTF_MASK;
+	base->CR = 0;
+	while ((base->CR & LPSPI_CR_MEN_MASK) != 0) {
+	}
+	base->SR = 0x3F00;
+
+	data->ctx.config = NULL;
+	dma_data->state = LPSPI_TRANSFER_STATE_DONE;
+}
+
 static struct dma_block_config *lpspi_dma_common_load(struct spi_dma_stream *stream,
 						      const struct device *dev,
 						      const uint8_t *buf, size_t len)
@@ -251,16 +274,12 @@ static int lpspi_dma_slave_release(const struct device* dev, const struct spi_co
 	unsigned int key = irq_lock();
 	bool was_active = (dma_data->state == LPSPI_TRANSFER_STATE_ACTIVE);
 	if (was_active) {
-		base->IER &= ~(LPSPI_IER_TEIE_MASK | LPSPI_IER_REIE_MASK);
-		base->DER &= ~(LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK);
 		dma_data->state = LPSPI_TRANSFER_STATE_DONE;
 	}
 	irq_unlock(key);
 
 	if (was_active) {
-		(void)dma_stop(dma_data->dma_tx.dma_dev, dma_data->dma_tx.channel);
-		(void)dma_stop(dma_data->dma_rx.dma_dev, dma_data->dma_rx.channel);
-		base->CR |= (LPSPI_CR_RTF_MASK | LPSPI_CR_RRF_MASK);
+		lpspi_dma_slave_abort(base, data, dma_data);
 		spi_context_complete(ctx, dev, -ECANCELED);
 	}
 	return spi_lpspi_release(dev, cfg);
@@ -340,12 +359,7 @@ static void lpspi_isr(const struct device *dev)
 	if (!terminate || dma_data->state == LPSPI_TRANSFER_STATE_DONE) {
 		return;
 	}
-	base->IER &= ~(LPSPI_IER_TEIE_MASK | LPSPI_IER_REIE_MASK);
-	base->DER &= ~(LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK);
-	(void)dma_stop(dma_data->dma_tx.dma_dev, dma_data->dma_tx.channel);
-	(void)dma_stop(dma_data->dma_rx.dma_dev, dma_data->dma_rx.channel);
-	base->CR |= LPSPI_CR_RTF_MASK | LPSPI_CR_RRF_MASK;
-	dma_data->state = LPSPI_TRANSFER_STATE_DONE;
+	lpspi_dma_slave_abort(base, data, dma_data);
 	spi_context_complete(ctx, dev, err);
 }
 
