@@ -278,8 +278,12 @@ static int lpspi_dma_slave_release(const struct device* dev, const struct spi_co
 	}
 	irq_unlock(key);
 
+	/* Always reset the peripheral on release so a stuck bit-misaligned LPSPI
+	 * gets scrubbed even when no transfer is currently in flight. The
+	 * was_active gate stays on spi_context_complete — that's only meaningful
+	 * if a caller was waiting on a pending transfer. */
+	lpspi_dma_slave_abort(base, data, dma_data);
 	if (was_active) {
-		lpspi_dma_slave_abort(base, data, dma_data);
 		spi_context_complete(ctx, dev, -ECANCELED);
 	}
 	return spi_lpspi_release(dev, cfg);
